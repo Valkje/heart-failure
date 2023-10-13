@@ -1,0 +1,139 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(dagitty)
+library(ggdag)
+library(survival)
+library(survminer)
+library(GGally)
+```
+
+```{r}
+dat <- read.csv("S1Data.csv")
+dat
+```
+
+Can't stand this misspelling.
+
+```{r}
+col_names <- names(dat)
+col_names[col_names == "Pletelets"] <- "Platelets"
+names(dat) <- col_names
+dat
+```
+
+
+```{r}
+for (i in 1:ncol(dat)) {
+  hist(dat[,i], main = col_names[i], xlab = col_names[i])
+}
+```
+
+```{r fig.height=10}
+ggpairs(dat, aes(alpha = 0.01), progress = FALSE)
+```
+
+From the plot above, there seems to be a reasonably strong correlation between smoking and gender.
+
+```{r}
+ggplot(dat, aes(Gender, Smoking)) +
+  geom_jitter()
+```
+
+# Find cut-off point
+
+Apparently barely any women in our data set were smoking.
+
+```{r}
+fit <- survfit(Surv(TIME, Event) ~ Gender, data = dat)
+fit
+```
+
+```{r fig.height=8}
+ggsurvplot(fit,
+          pval = TRUE, conf.int = TRUE,
+          risk.table = TRUE, # Add risk table
+          risk.table.col = "strata", # Change risk table color by groups
+          linetype = "strata", # Change line type by groups
+          surv.median.line = "hv", # Specify median survival
+          ggtheme = theme_bw(), # Change ggplot2 theme
+          palette = c("#E7B800", "#2E9FDF"),
+          ncensor.plot = TRUE)
+```
+
+```{r}
+cut_offs <- 0:200
+names(cut_offs) <- paste0("cut_off", cut_offs)
+
+dat_status <- dat %>%
+  add_column(!!!cut_offs) %>%
+  pivot_longer(cols = starts_with("cut_off"), 
+               names_to = "cut_off", 
+               values_to = "cut_off_val") %>%
+  group_by(cut_off_val) %>%
+  mutate(
+    censored = TIME < cut_off_val & Event == 0,
+    deceased = TIME < cut_off_val & Event == 1,
+    confirmed_alive = TIME >= cut_off_val
+  ) %>%
+  summarize(
+    n_censored = sum(censored),
+    n_deceased = sum(deceased),
+    n_confirmed_alive = sum(confirmed_alive)
+  ) 
+
+dat_status
+```
+
+```{r}
+df <- pivot_longer(dat_status, n_censored:n_confirmed_alive, names_to = "status")
+
+ggplot(df, aes(cut_off_val, value)) +
+  geom_line(aes(color = status)) +
+  labs(x = "Time (day)", y = "Number of patients")
+```
+
+There are periods of a sharp increase in censored patients, while the number of deceased patients only climbs gradually. The first jump in censored patients is just after t = 75, so around that time might be a good cut-off point. From the dat_status table, it is clear that we should then pick t = 74, as the only difference between t = 74 and t = 75 is an increase in censored patients.
+
+```{r}
+dat_cut <- dat %>%
+  filter(!(TIME < 74 & Event == 0)) %>%
+  rename(Deceased = Event) %>%
+  select(!TIME)
+
+dat_cut
+```
+
+```{r}
+saveRDS(dat_cut, "dat_cut.rds")
+```
+
+
+# Prepare Bayesian network
+
+```{r paged.print=FALSE}
+bn <- dagitty("dag{
+    Gender -> {Smoking Creatinine}
+    Age -> {Smoking Creatinine Deceased Ejection.Fraction BP}
+    BP -> {Creatinine Deceased Ejection.Fraction}
+    Sodium -> Ejection.Fraction
+    Ejection.Fraction -> Deceased
+    Creatinine -> Deceased
+    Smoking -> {Creatinine Deceased Ejection.Fraction BP}
+  }")
+
+ggdag(bn, layout = "circle")
+```
+
+```{r}
+impliedConditionalIndependencies(bn)
+```
+
+```{r paged.print=FALSE}
+localTests(bn, dat_cut)
+```
+
