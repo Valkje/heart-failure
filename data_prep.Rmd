@@ -17,23 +17,30 @@ dat <- read.csv("S1Data.csv")
 dat
 ```
 
-Can't stand this misspelling.
-
-```{r}
-col_names <- names(dat)
-col_names[col_names == "Pletelets"] <- "Platelets"
-names(dat) <- col_names
-dat
-```
-
-
 ```{r}
 for (i in 1:ncol(dat)) {
   hist(dat[,i], main = col_names[i], xlab = col_names[i])
 }
 ```
 
-```{r fig.height=10}
+Can't stand the "Pletelets" misspelling. Also convert all binary variables to categorical or boolean.
+
+```{r}
+col_names <- names(dat)
+col_names[col_names == "Pletelets"] <- "Platelets"
+names(dat) <- col_names
+
+dat <- dat %>%
+  mutate(
+    Gender = factor(Gender, labels = c("Female", "Male")),
+    across(Smoking:Anaemia, as.logical)
+  )
+
+dat
+```
+
+
+```{r fig.height=10, message=FALSE}
 ggpairs(dat, aes(alpha = 0.01), progress = FALSE)
 ```
 
@@ -134,6 +141,6 @@ impliedConditionalIndependencies(bn)
 ```
 
 ```{r paged.print=FALSE}
-localTests(bn, dat_cut)
+localTests(bn, dat_cut, type = "cis.pillai")
 ```
 
