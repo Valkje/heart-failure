@@ -131,6 +131,11 @@ dat_cut
 saveRDS(dat_cut, "dat_cut.rds")
 ```
 
+For convenience:
+
+```{r}
+dat_cut <- readRDS("dat_cut.rds")
+```
 
 # Prepare Bayesian network
 
@@ -169,9 +174,50 @@ ggdag(bn_plt) +
 ggsave(file.path('images', 'network_literature.pdf'))
 ```
 
+# Test network
+
 ```{r}
 impliedConditionalIndependencies(bn)
 ```
+
+## Correlations
+
+Convert all boolean/categorical columns to numeric, then run `localTests` with `type = "cis"`. This will regress all variables on their parents, and use the correlation between the resulting residuals to assess the amount of remaining dependence between the regressed variables.
+
+```{r paged.print=FALSE}
+dat_cut_num <- dat_cut %>%
+  mutate(across(where(~ !is.numeric(.x)), as.numeric))
+
+localTests(bn, dat_cut_num, type = "cis")
+```
+
+Creatinine and sodium have a relatively high correlation estimate and low p value, so they might not be independent after all. It is not the only violated independence assumption, but let's start by adding an edge from creatinine to sodium.
+
+```{r}
+bn2 <- dagitty("dag{
+    Gender -> {Smoking Creatinine Ejection.Fraction}
+    Age -> {Creatinine Deceased Ejection.Fraction BP}
+    BP -> {Creatinine Deceased Ejection.Fraction}
+    Sodium -> Ejection.Fraction
+    Ejection.Fraction -> Deceased
+    Creatinine -> {Deceased Sodium}
+    Smoking -> {Creatinine Deceased Ejection.Fraction BP}
+  }")
+
+ggdag(bn2, layout = "circle")
+```
+
+And run our tests again:
+
+```{r paged.print=FALSE}
+localTests(bn2, dat_cut_num, type = "cis")
+```
+
+This resolved all other independence assumption violations.
+
+## Canonical correlations
+
+Estimates are exactly the same as in the vanilla correlation case, p values are slightly different.
 
 ```{r paged.print=FALSE}
 localTests(bn, dat_cut, type = "cis.pillai")
