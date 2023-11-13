@@ -386,7 +386,7 @@ ggdag(bn2_tidy_sem) +
              data = filter(bn2_tidy_sem, abs(sem_est) > 0.01))
 ```
 
-Remove edges with p-values below 0.05.
+Remove edges with p-values above 0.05.
 
 ```{r}
 bn3_tidy_sem <- bn2_tidy_sem
