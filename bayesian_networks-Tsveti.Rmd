@@ -763,6 +763,7 @@ ggsave(file.path("images", "surv_strata.pdf"))
 ```
 #Propensity scoring
 
+
 ```{r}
 mdl <- glm(Creatinine ~ Age, data=dat_scaled)
 
@@ -785,13 +786,126 @@ ps_model <-glm(Creatinine ~ Age, data=dat_scaled, weights=ps)
 summary(ps_model)
 
 ```
-
 ```{r}
 cor_mdl <- coxph(Surv(TIME, Event) ~ Age,
                 data = dat_scaled,  weights=ps)
 
 summary(cor_mdl)
 ```
+# Propensity scores Tomas
+
+```{r}
+library( stddiff )
+library( forestplot )
+library( MatchIt )
+
+
+
+mdl <- lm( Creatinine ~ Age,
+            data=dat_scaled)
+
+sigma <- sd(mdl$residuals)
+
+y_hat <- fitted(mdl)
+y <- dat_scaled$Creatinine
+
+p_score = dnorm(y,y_hat,sigma)
+
+plot(y_hat, p_score)
+
+new_mdl <- glm( Creatinine ~ Age + p_score ,
+            data=dat_scaled)
+
+summary(new_mdl)
+
+```
+
+```{r}
+mdl_lin<- glm( Event ~ Creatinine + Age + p_score ,
+            data=dat_scaled)
+#summary(mdl_lin)
+
+mdl_lin1<- glm( Event ~ Creatinine + Age ,
+            data=dat_scaled)
+#summary(mdl_lin1)
+
+
+mdl_cx <- coxph(Surv(TIME, Event) ~ Creatinine + Age + p_score,
+                data = dat_scaled)
+
+#summary( mdl_cx )
+
+
+
+mdl_cx1 <- coxph(Surv(TIME, Event) ~ Creatinine + Age,
+                data = dat_scaled)
+
+summary( mdl_cx1 )
+```
+
+```{r}
+pscore_logit <- predict( mdl )
+pscore <- exp(pscore_logit) / (1+exp(pscore_logit))
+
+
+# You would typically use the method "nearest" with a specified caliper for propensity scores
+
+# Convert levels "Q1" and "Q2" to FALSE (0), and "Q3" and "Q4" to TRUE (1)
+dat_structure_learn$Creatinine_binary <- ifelse(dat_structure_learn$Creatinine %in% c("Q1 (Lowest)", "Q2"), 0, 1)
+
+# Convert the new binary variable to a factor with labels FALSE and TRUE
+dat_structure_learn$Creatinine_binary <- factor(dat_structure_learn$Creatinine_binary, levels = c(0, 1), labels = c("FALSE", "TRUE"))
+
+
+mm <- matchit(Creatinine_binary ~ pscore, data = dat_structure_learn, method = "full")
+
+matched_data <- match.data(mm)
+#summary(coxph(Surv(TIME, Event) ~ Creatinine + Age,
+ #        data = dat_structure_learn))
+```
+
+```{r}
+# Assuming 'treatment' is your binary or multi-level treatment variable
+# 'pscore' is your precomputed propensity score
+# 'dat_structure_learn' is your data frame
+library(Matching)
+# Assuming 'pscore' is your vector of propensity scores
+# Prepare a matrix of the covariates used to compute 'pscore'
+X <- model.matrix(Creatinine~ pscore, data = dat_structure_learn)
+
+# Perform matching
+matched_results <- Match(Y = dat_structure_learn$Creatinine, Tr = pscore, X = X, M = 1)
+
+# Extract indices of matched units
+matched_indices <- matched_results$index.treated
+
+# Subset the original data to get the matched dataset
+matched_data <- dat_structure_learn[matched_indices, ]
+
+
+```
+```{r}
+cls <- c("Age")
+match_imb <- as.data.frame(stddiff.numeric(dat_scaled, vcol=cls, gcol="Creatinine"))
+forestplot(
+labeltext = cls,
+mean=match_imb$stddiff,
+lower=match_imb$stddiff.l,
+upper=match_imb$stddiff.u )
+
+```
+
+```{r}
+cls <- c("Age")
+match_imb <- as.data.frame(stddiff.numeric(matched_data, vcol=cls, gcol="Creatinine"))
+forestplot(
+labeltext = cls,
+mean=match_imb$stddiff,
+lower=match_imb$stddiff.l,
+upper=match_imb$stddiff.u )
+
+```
+
 #Case control
 
 ```{r}
@@ -799,7 +913,7 @@ table( dat_scaled$Event )
 ```
 
 ```{r}
-samp <- rep(0,nrow(dat_scaled))
+samp <- rep("FALSE",nrow(dat_scaled))
 samp[dat_scaled$Event=="TRUE"] <- "TRUE"
 ```
 
@@ -837,8 +951,6 @@ legend("topleft", c("population", "sample"), lty = 1, col = 1:2)
 
 ```
 
-Barely any difference :(, does not seem very useful
-
 ```{r}
 m <- glm( Event ~ Creatinine, dat_scaled, family="binomial" )
 coef(m)
@@ -846,7 +958,7 @@ coef(m)
 
 ```{r}
 m_2 <- glm( Event ~ Creatinine, dat_scaled[samp=="TRUE",], family="binomial" )
-coef(m)
+coef(m_2)
 ```
 
 ```{r}
@@ -856,6 +968,7 @@ ci <- confint(m)['Creatinine',]
 
 segments( x0=ci[1], x1=ci[2], y0=2, y1=2 )
 
+
 points( coef(m_2)['Creatinine'], 1, pch=19, col=2 )
 ci <- confint(m_2)['Creatinine',]
 
@@ -863,95 +976,6 @@ segments( x0=ci[1], x1=ci[2], y0=1, y1=1, col=2 )
 legend( "topright", c("population","sample"), lty=1, col=1:2 )
 
 ```
-
-#Case controls with propensity scores
-
-```{r}
-dat_cc_prop_scores <- dat_scaled
-dat_cc_prop_scores$ps <- ps
-
-```
-
-```{r}
-# Sort data by propensity scores
-dat_cc_prop_scores <- dat_cc_prop_scores[order(dat_cc_prop_scores$ps),]
-
-matchit <- matchit(Event ~ ps, data = dat_cc_prop_scores, method = "nearest", replace = FALSE)
-
-# Get the matched dataset
-matched_data <- match.data(matchit)
-
-```
-
-```{r}
-m_matched <- lm(Event ~ Creatinine, data = matched_data)
-coef_matched <- coef(m_matched)
-
-print(coef_matched)
-```
-```{r}
-
-m_population <- lm(Event ~ Creatinine, data = dat_cc_prop_scores)
-coef_population <- coef(m_population)
-
-print(coef_population)
-```
-
-```{r}
-# Plot the coefficient for Creatinine
-plot(coef_matched['Creatinine'], 2, xlim=c(0,0.3), ylim=c(0.5,2.5), pch=19,
-     yaxt="n", ylab="", bty="n" )
-
-ci_matched <- confint(m_matched)['Creatinine',]
-segments(x0=ci_matched[1], x1=ci_matched[2], y0=2, y1=2)
-
-# Plot the population
-ci_population <- confint(m_population)['Creatinine',]
-
-points(coef_population['Creatinine'], 1, pch=19, col=2)
-segments(x0=ci_population[1], x1=ci_population[2], y0=1, y1=1)
-
-legend("topright", legend=c("Matched Sample", "Population"),
-       pch=19, col=1:2)
-
-```
-Effect is slightly stronger for population than in the sample, aka matched sample suggests that creatinine has a smaller effect on Event than the population would suggest (this is also backed by our covariate adjustment)
-```{r}
-m_matched <- glm(Event ~ Creatinine, data = matched_data, family="binomial")
-coef_matched <- coef(m_matched)
-
-print(coef_matched)
-```
-
-```{r}
-m_population <- glm(Event ~ Creatinine, data = dat_cc_prop_scores, family="binomial")
-coef_population <- coef(m_population)
-
-print(m_population)
-```
-
-
-```{r}
-plot(coef_matched['Creatinine'], 2, xlim=c(0,1.5), ylim=c(0.5,2.5), pch=19,
-     yaxt="n", ylab="", bty="n" )
-
-ci_matched <- confint(m_matched)['Creatinine',]
-segments(x0=ci_matched[1], x1=ci_matched[2], y0=2, y1=2)
-
-# Plot the population
-
-ci_population <- confint(m_population)['Creatinine',]
-
-points(coef_population['Creatinine'], 1, pch=19, col=2)
-segments(x0=ci_population[1], x1=ci_population[2], y0=1, y1=1)
-
-legend("topright", legend=c("Matched Sample", "Population"),
-       pch=19, col=1:2)
-
-coef(m_population)
-coef(m_matched)
-```
-I dont really see a difference apart from the scale 
 
 #Structure learning
 
@@ -1077,7 +1101,7 @@ fit <- bnlearn::pc.stable(dat_structure_learn, whitelist = whitelist, blacklist=
 ```
 
 ```{r}
-# Assuming df is your dataframe and col_to_move is the name of the column you want to move to the end
+
 dat_learning_ordered <- dat_structure_learn_no_Smok[c(setdiff(names(dat_structure_learn_no_Smok), "Event"), "Event")]
 
 fit <- hc(dat_structure_learn_no_Smok, start = final_dag)
