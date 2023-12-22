@@ -1,0 +1,164 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r setup}
+library(tidyverse)
+library(survival)
+library(survminer)
+```
+
+```{r}
+dat <- read.csv("S1Data.csv")
+
+dat_scaled <- dat %>%
+  mutate(
+    Gender = factor(Gender, labels = c("Female", "Male")),
+    across(c(Event, Smoking:Anaemia), as.logical),
+    CreatinineLog = log(Creatinine)
+  ) %>%
+  mutate(across(where(is.numeric), function(x) {
+    if (cur_column() == "TIME") return(x)
+    scale(x)
+  }))
+
+dat_scaled
+```
+
+```{r}
+hist(dat_scaled$Creatinine)
+
+hist(dat_scaled$CreatinineLog)
+```
+
+
+```{r}
+mdl <- lm( CreatinineLog ~ Age,
+            data=dat_scaled)
+
+sigma <- sd(mdl$residuals)
+
+y_hat <- fitted(mdl)
+y <- dat_scaled$CreatinineLog
+
+p_score = dnorm(y,y_hat,sigma)
+
+plot(y, p_score)
+```
+
+```{r}
+plot(y, mdl$residuals)
+```
+
+```{r}
+qqnorm(mdl$residuals)
+qqline(mdl$residuals)
+```
+
+```{r}
+m_cox <- coxph(Surv(TIME, Event) ~ Creatinine,
+                data = dat_scaled)
+
+summary( m_cox )
+```
+
+# Adjusting for propensity score
+
+```{r}
+m_cox_adjust <- coxph(Surv(TIME, Event) ~ Creatinine + Age + p_score,
+                      data = dat_scaled)
+
+summary( m_cox_adjust )
+```
+
+```{r fig.height=5, fig.width=12}
+crea_df <- with(dat_scaled, {
+  data.frame(
+    Age = mean(Age),
+    p_score = mean(p_score),
+    Creatinine = quantile(Creatinine, c(0.1, 0.5, 0.9))
+  )
+})
+
+cox_crea <- survfit(m_cox, newdata = crea_df)
+g_crea <- ggsurvplot(cox_crea,
+                     ggtheme = theme_minimal(), data = crea_df) +
+  labs(title = "A) Survival by SC levels - unadjusted for propensity")
+
+cox_crea_adj <- survfit(m_cox_adjust, newdata = crea_df)
+g_crea_adj <- ggsurvplot(cox_crea_adj,
+                         ggtheme = theme_minimal(), data = crea_df) +
+  labs(title = "B) Survival by SC levels - adjusted for propensity")
+
+ggarrange(plotlist = lapply(list(g_crea, g_crea_adj), function (sp) {
+  sp$plot +
+    theme(
+      text = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+}))
+
+ggsave(file.path("images", "surv_propensity.pdf"), width = 12, height = 5)
+```
+
+# Inverse probability weighting
+
+Numerator of IPW. See https://meghapsimatrix.com/post/continuous-r-rmarkdown/, which refers Robins et al. (2000).
+
+```{r}
+mdl_num <- lm(CreatinineLog ~ 1, data = dat_scaled)
+
+sigma_num <- sd(mdl_num$residuals)
+y_hat_num <- fitted(mdl_num)
+
+num <- dnorm(y, y_hat_num, sigma_num)
+
+dat_scaled <- dat_scaled %>%
+  mutate(ipw = num / p_score)
+```
+
+```{r}
+qqnorm(dat_scaled$ipw)
+qqline(dat_scaled$ipw)
+```
+
+```{r}
+m_cox_ipw <- coxph(Surv(TIME, Event) ~ Creatinine,
+                      data = dat_scaled, weights = ipw)
+
+summary( m_cox_ipw )
+```
+
+```{r fig.height=5, fig.width=12}
+crea_df <- with(dat_scaled, {
+  data.frame(
+    Creatinine = quantile(Creatinine, c(0.1, 0.5, 0.9))
+  )
+})
+
+cox_crea <- survfit(m_cox, newdata = crea_df)
+g_crea <- ggsurvplot(cox_crea,
+                     ggtheme = theme_minimal(), data = crea_df) +
+  labs(title = "A) Survival by SC levels - unadjusted")
+
+cox_crea_adj <- survfit(m_cox_ipw, newdata = crea_df)
+g_crea_adj <- ggsurvplot(cox_crea_adj,
+                         ggtheme = theme_minimal(), data = crea_df) +
+  labs(title = "B) Survival by SC levels - inverse probability weighted")
+
+ggarrange(plotlist = lapply(list(g_crea, g_crea_adj), function (sp) {
+  sp$plot +
+    theme(
+      text = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+}))
+
+ggsave(file.path("images", "surv_propensity_ipw.pdf"), width = 12, height = 5)
+```
+
