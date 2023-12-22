@@ -1,0 +1,1111 @@
+---
+title: "R Notebook"
+output:
+  html_notebook:
+    toc: yes
+    df_print: paged
+    toc_float: yes
+    theme: spacelab
+---
+
+```{r setup, collapse=TRUE}
+library(reshape2)
+library(tidyverse)
+library(dagitty)
+library(ggdag)
+library(survival)
+library(survminer)
+library(GGally)
+library(ggpubr)
+library(lavaan)
+library( stddiff )
+library( forestplot )
+library( MatchIt )
+```
+
+```{r}
+dat <- read.csv("S1Data.csv")
+dat
+```
+
+```{r}
+col_names <- names(dat)
+for (i in 1:ncol(dat)) {
+  hist(dat[,i], main = col_names[i], xlab = col_names[i])
+}
+```
+
+Can't stand the "Pletelets" misspelling. Also convert all binary variables to categorical or boolean.
+
+```{r}
+col_names[col_names == "Pletelets"] <- "Platelets"
+names(dat) <- col_names
+
+dat <- dat %>%
+  mutate(
+    Gender = factor(Gender, labels = c("Female", "Male")),
+    across(c(Event, Smoking:Anaemia), as.logical)
+  )
+
+dat
+```
+
+From the plot above, there seems to be a reasonably strong correlation between smoking and gender.
+
+```{r}
+ggplot(dat, aes(Gender, Smoking)) +
+  geom_jitter()
+```
+
+```{r}
+chisq.test(dat$Gender, dat$Smoking)
+```
+
+
+# Find cut-off point
+
+Apparently barely any women in our data set were smoking.
+
+```{r}
+fit <- survfit(Surv(TIME, Event) ~ Gender, data = dat)
+fit
+```
+
+```{r fig.height=8}
+ggsurvplot(fit,
+          pval = TRUE, conf.int = TRUE,
+          risk.table = TRUE, # Add risk table
+          risk.table.col = "strata", # Change risk table color by groups
+          linetype = "strata", # Change line type by groups
+          surv.median.line = "hv", # Specify median survival
+          ggtheme = theme_bw(), # Change ggplot2 theme
+          palette = c("#E7B800", "#2E9FDF"),
+          ncensor.plot = TRUE)
+```
+
+```{r}
+cut_offs <- 0:200
+names(cut_offs) <- paste0("cut_off", cut_offs)
+
+dat_status <- dat %>%
+  add_column(!!!cut_offs) %>%
+  pivot_longer(cols = starts_with("cut_off"), 
+               names_to = "cut_off", 
+               values_to = "cut_off_val") %>%
+  group_by(cut_off_val) %>%
+  mutate(
+    censored = TIME < cut_off_val & Event == 0,
+    deceased = TIME < cut_off_val & Event == 1,
+    confirmed_alive = TIME >= cut_off_val
+  ) %>%
+  summarize(
+    n_censored = sum(censored),
+    n_deceased = sum(deceased),
+    n_confirmed_alive = sum(confirmed_alive)
+  ) 
+
+dat_status
+```
+
+```{r}
+df <- pivot_longer(dat_status, n_censored:n_confirmed_alive, names_to = "status")
+
+ggplot(df, aes(cut_off_val, value)) +
+  geom_line(aes(color = status), linewidth = 1) +
+  labs(x = "Time (day)", y = "Number of patients") +
+  scale_color_hue(name = "Patient status", labels = c("Censored", "Alive", "Deceased")) +
+  theme_minimal()
+
+ggsave(file.path("images", "cut_off.pdf"))
+```
+
+There are periods of a sharp increase in censored patients, while the number of deceased patients only climbs gradually. The first jump in censored patients is just after t = 75, so around that time might be a good cut-off point. From the dat_status table, it is clear that we should then pick t = 74, as the only difference between t = 74 and t = 75 is an increase in censored patients.
+
+```{r}
+dat_cut <- dat %>%
+  filter(!(TIME < 74 & Event == 0)) %>%
+  rename(Deceased = Event) %>%
+  select(!TIME)
+
+dat_cut
+```
+
+```{r}
+saveRDS(dat_cut, "dat_cut.rds")
+```
+
+For convenience:
+
+```{r}
+dat_cut <- readRDS("dat_cut.rds")
+```
+
+# Prepare Bayesian network
+
+```{r paged.print=FALSE}
+bn <- dagitty("dag{
+    Gender -> {Smoking Creatinine Ejection.Fraction}
+    Age -> {Creatinine Deceased Ejection.Fraction BP}
+    BP -> {Creatinine Deceased Ejection.Fraction}
+    Sodium -> Ejection.Fraction
+    Ejection.Fraction -> Deceased
+    Creatinine -> Deceased
+    Smoking -> {Creatinine Deceased Ejection.Fraction BP}
+  }")
+
+# Just for plotting
+bn_plt <- tidy_dagitty(bn, layout = "circle")
+node_labels <- c(
+  "Age" = "Age", 
+  "BP" = "BP", 
+  "Creatinine" = "SC", 
+  "Deceased" = "D", 
+  "Ejection.Fraction" = "EF", 
+  "Gender" = "Sex", 
+  "Smoking" = "Sm", 
+  "Sodium" = "SS"
+)
+bn_plt <- bn_plt %>%
+  mutate(
+    name = node_labels[name],
+    to = node_labels[to]
+  )
+
+ggdag(bn_plt) +
+  theme_dag_blank()
+
+ggsave(file.path('images', 'network_literature.pdf'))
+```
+
+# Test network
+
+```{r}
+impliedConditionalIndependencies(bn)
+```
+
+## Correlations
+
+Convert all boolean/categorical columns to numeric, then run `localTests` with `type = "cis"`. This will regress all variables on their parents, and use the correlation between the resulting residuals to assess the amount of remaining dependence between the regressed variables.
+
+```{r paged.print=FALSE}
+dat_cut_num <- dat_cut %>%
+  mutate(across(where(~ !is.numeric(.x)), as.numeric))
+
+localTests(bn, dat_cut_num, type = "cis")
+```
+
+Creatinine and sodium have a relatively high correlation estimate and low p value, so they might not be independent after all. It is not the only violated independence assumption, but let's start by adding an edge from creatinine to sodium.
+
+```{r}
+bn2 <- dagitty("dag{
+    Gender -> {Smoking Creatinine Ejection.Fraction}
+    Age -> {Creatinine Deceased Ejection.Fraction BP}
+    BP -> {Creatinine Deceased Ejection.Fraction}
+    Sodium -> Ejection.Fraction
+    Ejection.Fraction -> Deceased
+    Creatinine -> {Deceased Sodium}
+    Smoking -> {Creatinine Deceased Ejection.Fraction BP}
+  }")
+
+ggdag(bn2, layout = "circle")
+```
+
+And run our tests again:
+
+```{r paged.print=FALSE}
+localTests(bn2, dat_cut_num, type = "cis")
+```
+
+This resolved all other independence assumption violations.
+
+## Canonical correlations
+
+Estimates are exactly the same as in the vanilla correlation case, p values are slightly different.
+
+```{r paged.print=FALSE}
+localTests(bn, dat_cut, type = "cis.pillai")
+```
+
+```{r}
+bn2 <- dagitty("dag{
+    Gender -> {Smoking Creatinine Ejection.Fraction}
+    Age -> {Creatinine Deceased Ejection.Fraction BP}
+    BP -> {Creatinine Deceased Ejection.Fraction}
+    Sodium -> Ejection.Fraction
+    Ejection.Fraction -> Deceased
+    Creatinine -> {Deceased Sodium}
+    Smoking -> {Creatinine Deceased Ejection.Fraction BP}
+  }")
+
+ggdag(bn2, layout = "circle")
+```
+
+```{r paged.print=FALSE}
+localTests(bn2, dat_cut, type = "cis.pillai")
+```
+
+# Find network coefficients
+
+## Canonical correlations
+
+```{r}
+r <- c()
+for (n in names(bn2)) {
+  for (p in parents(bn2, n)) {
+    otherparents <- setdiff(parents(bn2, n), p)
+    tst <- ciTest(X=n, Y=p, Z=otherparents, dat_cut, type="cis.pillai" )
+    r <- rbind(r, data.frame(
+      name=p,
+      direction="->",
+      to=n, 
+      cor=tst[,"estimate"],
+      p=tst[,"p.value"]
+    ))
+  }
+}
+
+r
+```
+
+```{r}
+bn2_tidy <- tidy_dagitty(bn2, layout = "circle") 
+
+bn2_tidy$data <- bn2_tidy$data %>%
+  full_join(r, by = c("name", "direction", "to")) %>%
+  mutate(
+    x_text = (x + xend) / 2, 
+    y_text = (y + yend) / 2,
+    cor = round(cor, 2),
+    # Some manual adjustments to certain labels clearer
+    x_text = case_when(
+      name == "Age" & to == "Ejection.Fraction" ~ 0.1,
+      name == "BP" & to == "Deceased" ~ -0.354,
+      TRUE ~ x_text
+    ),
+    y_text = case_when(
+      name == "Smoking" & to == "Creatinine" ~ -0.2,
+      TRUE ~ y_text
+    )
+  )
+
+bn2_tidy
+```
+
+```{r}
+ggdag(bn2_tidy) +
+  geom_label(aes(x_text, y_text, label = cor), 
+             data = filter(bn2_tidy, abs(cor) > 0.01))
+```
+
+## Polychoric correlations
+
+Here we need to treat binary variables as numeric. Perhaps it makes more sense to estimate the GGM using linear regressions rather than polychoric correlations?
+
+```{r}
+dat_cut_num <- dat_cut %>%
+  mutate(
+    across(c(Deceased:Anaemia), as.numeric),
+    across(everything(), scale) # Otherwise lavaan complains
+  )
+
+cov_mat <- lavCor(dat_cut_num)
+cov_mat
+```
+
+```{r}
+localTests(bn2, sample.cov = cov_mat, sample.nobs = nrow(dat_cut_num))
+```
+
+```{r}
+cov_df <- melt(cov_mat) %>%
+  rename(
+    name = Var1,
+    to = Var2,
+    poly_cor = value
+  )
+
+bn2_tidy_poly <- bn2_tidy
+bn2_tidy_poly$data <- bn2_tidy_poly$data %>%
+  left_join(cov_df, by = c("name", "to")) %>%
+  mutate(poly_cor = round(poly_cor, 2))
+
+bn2_tidy_poly
+```
+
+```{r}
+ggdag(bn2_tidy_poly) +
+  geom_label(aes(x_text, y_text, label = poly_cor), 
+             data = filter(bn2_tidy_poly, abs(poly_cor) > 0.01))
+```
+
+## Gaussian graphical model
+
+```{r}
+ggm <- "
+  Creatinine ~ Gender + Smoking + Age + BP
+  BP ~ Smoking + Age
+  Sodium ~ Creatinine
+  Smoking ~ Gender
+  Ejection.Fraction ~ BP + Age + Sodium + Smoking + Gender
+  Deceased ~ Creatinine + BP + Age + Smoking + Ejection.Fraction
+"
+
+ggm_sem <- sem(ggm, data = dat_cut_num)
+ggm_sem
+```
+
+```{r}
+summ <- summary(ggm_sem)
+summ
+```
+
+```{r}
+ggm_est <- summ$pe %>%
+  filter(op == "~") %>%
+  select(lhs, rhs, est, pvalue) %>%
+  rename(sem_est = est, sem_pvalue = pvalue) %>%
+  mutate(sem_est = round(sem_est, 2))
+
+ggm_est
+```
+
+```{r}
+bn2_tidy_sem <- bn2_tidy
+
+bn2_tidy_sem$data <- bn2_tidy_sem$data %>%
+  left_join(ggm_est, by = c("name" = "rhs", "to" = "lhs"))
+
+bn2_tidy_sem
+```
+
+```{r}
+ggdag(bn2_tidy_sem) +
+  geom_label(aes(x_text, y_text, label = sem_est), 
+             data = filter(bn2_tidy_sem, abs(sem_est) > 0.01))
+```
+
+Remove edges with p-values above 0.05.
+
+```{r}
+bn3_tidy_sem <- bn2_tidy_sem
+bn3_tidy_sem$data <- bn3_tidy_sem$data %>%
+  filter(sem_pvalue < 0.05) %>%
+  # Add deleted nodes back in
+  add_row(
+    name = c("Deceased", "Smoking"),
+    x = c(-7.071068e-01, 0),
+    y = c(7.071068e-01, -1)
+  )
+
+ggdag(bn3_tidy_sem) +
+  geom_label(aes(x_text, y_text, label = sem_est))
+```
+
+### Trimmed GGM
+
+Rerun SEM with trimmed graphical model.
+
+```{r}
+ggm2 <- "
+  Creatinine ~ Age
+  Sodium ~ Creatinine
+  Smoking ~ Gender
+  Ejection.Fraction ~ Sodium + Gender
+  Deceased ~ Creatinine + Age + Ejection.Fraction
+  Smoking ~~ 0*Deceased
+  Age ~~ 0*Gender
+"
+
+ggm_sem2 <- sem(ggm2, data = dat_cut_num)
+ggm_sem2
+```
+
+```{r}
+summary(ggm_sem2)
+```
+
+```{r}
+summary(ggm_sem2)$pe
+```
+
+
+```{r}
+ggm2_coef <- summary(ggm_sem2)$pe
+
+ggm2_var <- ggm2_coef %>%
+  filter(lhs == rhs) %>%
+  select(rhs, est) %>%
+  rename(var = est) %>%
+  mutate(var = round(var, 2))
+
+ggm_est2 <- ggm2_coef %>%
+  filter(op == "~") %>%
+  select(lhs, rhs, est, pvalue) %>%
+  rename(sem_est2 = est, sem_pvalue2 = pvalue) %>%
+  mutate(sem_est2 = round(sem_est2, 2)) %>%
+  left_join(ggm2_var, by = c("rhs"))
+  
+ggm_est2
+```
+
+Taking just a quick look at the new coefficients. Comparing them with the first GGM shows that they have not changed. Too lazy to fix the missing Smoking node.
+
+```{r}
+bn4_tidy_sem <- bn2_tidy_sem
+bn4_tidy_sem$data <- bn4_tidy_sem$data %>%
+  left_join(ggm_est2, by = c("name" = "rhs", "to" = "lhs"))
+
+ggdag(bn4_tidy_sem %>% filter(is.na(to) | !is.na(sem_est2))) +
+  geom_label(aes(x_text, y_text, label = sem_est2))
+```
+
+## Cox regression
+
+We are keeping in all edges as determined from the literature, even if the GGM would have them removed.
+
+```{r}
+# Scale dat to make sure coefficients have same scale
+dat_scaled <- dat %>%
+  mutate(across(where(is.numeric), function(x) {
+    if (cur_column() == "TIME") return(x)
+    scale(x)
+  }))
+
+cox_m1 <- coxph(Surv(TIME, Event) ~ Creatinine + 
+                  Age + 
+                  Smoking + 
+                  Ejection.Fraction +
+                  BP,
+                data = dat_scaled)
+cox_m1
+```
+
+```{r}
+summ_cox <- summary(cox_m1)
+summ_cox
+```
+
+This shows that smoking barely has any effect on survival. Removing the edge between Smoking and Deceased would cause Smoking to no longer have any outgoing edges, so we drop it completely from the network.
+
+```{r}
+cox_m1_fit <- survfit(cox_m1, data = dat_scaled)
+
+# Plot the baseline survival function
+ggsurvplot(cox_m1_fit, palette = "#2E9FDF",
+           ggtheme = theme_minimal())
+```
+
+```{r}
+############# Serum creatinine
+
+crea_df <- with(dat_scaled, {
+  data.frame(
+    Age = mean(Age),
+    Smoking = FALSE,
+    Ejection.Fraction = mean(Ejection.Fraction),
+    BP = FALSE,
+    Creatinine = quantile(Creatinine, c(0.1, 0.5, 0.9))
+  )
+})
+
+g_crea <- ggsurvplot(survfit(cox_m1, newdata = crea_df),
+           ggtheme = theme_minimal(), data = crea_df) +
+  labs(title = "A) Survival by serum creatinine levels")
+
+############# Ejection fraction
+
+ejec_df <- with(dat_scaled, {
+  data.frame(
+    Age = mean(Age),
+    Smoking = FALSE,
+    Ejection.Fraction = quantile(Ejection.Fraction, c(0.1, 0.5, 0.9)),
+    BP = FALSE,
+    Creatinine = mean(Creatinine)
+  )
+})
+
+g_ejec <- ggsurvplot(survfit(cox_m1, newdata = ejec_df),
+           ggtheme = theme_minimal(), data = ejec_df) +
+  labs(title = "B) Survival by ejection fraction levels")
+
+############# Age
+
+# Roughly corresponds to 10%, 50%, 90% quantiles
+age_scale <- attr(dat_scaled$Age, "scaled:scale")
+age_center <- attr(dat_scaled$Age, "scaled:center")
+ages = c(45, 60, 75)
+
+age_df <- with(dat_scaled, {
+  data.frame(
+    Age = (ages - age_center) / age_scale,
+    Smoking = FALSE,
+    Ejection.Fraction = mean(Ejection.Fraction),
+    BP = FALSE,
+    Creatinine = mean(Creatinine)
+  )
+})
+
+cox_m1_fit_age <- survfit(cox_m1, newdata = age_df)
+g_age <- ggsurvplot(cox_m1_fit_age, legend.labs = ages,
+                    ggtheme = theme_minimal(), data = age_df) +
+  labs(title = "C) Survival by age")
+
+############# BP
+
+bp_df <- with(dat_scaled, {
+  data.frame(
+    Age = mean(Age),
+    Smoking = FALSE,
+    Ejection.Fraction = mean(Ejection.Fraction),
+    BP = c(TRUE, FALSE),
+    Creatinine = mean(Creatinine)
+  )
+})
+
+g_bp <- ggsurvplot(survfit(cox_m1, newdata = bp_df, legend.labs = c("TRUE", "FALSE")),
+                   ggtheme = theme_minimal(), data = bp_df)  +
+  labs(title = "D) Survival by high blood pressure")
+
+g_bp$plot <- g_bp$plot +
+  scale_color_hue(labels = c("High", "Low")) +
+  scale_fill_hue(labels = c("High", "Low"))
+```
+
+```{r}
+quantile(dat$Creatinine, c(0.1, 0.5, 0.9))
+quantile(dat$Ejection.Fraction, c(0.1, 0.5, 0.9))
+```
+
+
+```{r fig.height=10}
+ggarrange(plotlist = lapply(list(g_crea, g_ejec, g_age, g_bp), function (sp) {
+  sp$plot +
+    theme(
+      text = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+}))
+ggsave(file.path("images", "surv_strata.pdf"), width = 12, height = 10)
+```
+
+
+## Final network
+
+Drop Smoking and merge Cox regression estimates with second set of GGM estimates.
+
+```{r}
+summ_cox$coefficients[,1]
+```
+
+
+```{r}
+cox_coef <- summ_cox$coefficients[,1]
+names(cox_coef) <- c("Creatinine", "Age", "Smoking", "Ejection.Fraction", "BP")
+
+# Recreate tidy DAG to get a new layout
+bn_final <- tidy_dagitty(bn2, layout = 'dh')
+
+bn_final$data <- bn_final$data %>%
+  left_join(ggm_est2, by = c("name" = "rhs", "to" = "lhs")) %>%
+  mutate(
+    coef = case_when(
+      to == "Deceased" & name %in% names(cox_coef) ~ round(cox_coef[name], 2),
+      TRUE ~ sem_est2
+    ),
+    var = case_when(
+      var != 1 ~ var,
+      TRUE ~ NA_real_
+    )
+  ) %>%
+  relocate(coef, .before = xend) %>%
+  filter((name != "Smoking" & to != "Smoking" & !is.na(coef)) | is.na(to)) %>%
+  mutate(
+    name = node_labels[name],
+    to = node_labels[to]
+  )
+
+bn_final
+
+ggplot(bn_final, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point() +
+  geom_dag_edges(aes(label = coef), 
+                 angle_calc = "along", 
+                 label_dodge = unit(2.5, 'mm')) +
+  geom_dag_text(col = "white")
+```
+
+Perhaps it's clearer if we fix the coordinates ourselves:
+
+```{r}
+coords <- matrix(c(
+  -10, -11, # Age
+  -7, -5, # BP
+  -10, -9, # SC
+  -7, -8, # D
+  -10, -5, # EF
+  -13, -5, # Sex
+  0, 0, # Smoking [not included]
+  -10, -7 # So
+), ncol = 2, byrow = TRUE)
+
+rownames(coords) <- node_labels
+colnames(coords) <- c("x", "y")
+
+bn_tmp <- bn_final$data %>%
+  mutate(
+    x = coords[name, "x"],
+    y = coords[name, "y"],
+    xend = coords[replace_na(to, "Sm"), "x"],
+    yend = coords[replace_na(to, "Sm"), "y"]
+  )
+
+ggplot(bn_tmp, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_dag_point() +
+  geom_dag_edges(aes(label = coef), 
+                 angle_calc = "along", 
+                 label_dodge = unit(-2.75, 'mm')) +
+  geom_dag_text(col = "white") +
+  geom_label(aes(label = ifelse(is.na(var), NA, paste("sigma^2 ==", var))), 
+             nudge_x = -0.4, nudge_y = 0.7, parse = TRUE, hjust = 1) +
+  xlim(-15, -5) +
+  ylim(-11.5, -3.5) +
+  theme_dag_blank()
+
+ggsave(file.path("images", "network_coefficients.pdf"))
+```
+# Covariate adjustment
+
+Check that it is the correct structure:
+
+```{r}
+final_dag <- dagitty("dag
+{BP->D 
+{Age -> SC} -> D 
+SC -> SS -> EF 
+Sex -> EF -> D 
+SS -> EF -> D}")
+
+ggdag(final_dag, layout = "circle")
+```
+Find the adjustment set: 
+
+```{r}
+final_dag <- "dag{
+BP->D
+{Age -> SC} -> D
+SC -> SS -> EF
+Sex -> EF -> D
+SS -> EF -> D}"
+
+adjustmentSets(final_dag, "SC", "D")
+```
+Fit a regression model without adjusting for age:
+
+```{r}
+not_adjusted <- coxph(Surv(TIME, Event) ~ Creatinine,
+                data = dat_scaled)
+summary(not_adjusted)
+exp(coef(not_adjusted))
+```
+
+We fit a logistic regression model, adjusting for Age:
+
+```{r}
+age_adjusted <- coxph(Surv(TIME, Event) ~ Creatinine + Age,
+                data = dat_scaled)
+summary(age_adjusted)
+exp(coef(age_adjusted))
+```
+Making plots:
+
+```{r}
+
+unadjusted_df <- with(dat_scaled, {
+  data.frame(
+    Creatinine = quantile(Creatinine, c(0.1, 0.5, 0.9))
+  )
+})
+
+g_age_unadjusted <- ggsurvplot(survfit(not_adjusted, newdata = unadjusted_df),
+           ggtheme = theme_minimal(), data = unadjusted_df) +
+  labs(title = "A) Survival by serum creatinine levels - unadjusted")
+```
+
+```{r}
+
+adjusted_df <- with(dat_scaled, {
+  data.frame(
+    Age = mean(Age),
+    Creatinine = quantile(Creatinine, c(0.1, 0.5, 0.9))
+  )
+})
+
+g_age_adjusted <- ggsurvplot(survfit(age_adjusted, newdata = adjusted_df),
+           ggtheme = theme_minimal(), data = adjusted_df) +
+  labs(title = "B) Survival by serum creatinine levels - adjusted")
+
+```
+
+```{r fig.width=10, fig.height=5}
+ggarrange(plotlist = lapply(list(g_age_unadjusted, g_age_adjusted), function (sp) {
+  sp$plot +
+    theme(
+      text = element_text(size = 12),
+      axis.text = element_text(size = 12),
+      axis.title = element_text(size = 14),
+      legend.text = element_text(size = 12)
+    )
+}))
+
+ggsave(file.path("images", "surv_strata.pdf"))
+```
+#Propensity scoring
+
+
+```{r}
+mdl <- glm(Creatinine ~ Age, data=dat_scaled)
+
+summary(mdl)
+
+```
+
+```{r}
+
+y_hat <- predict(mdl)
+residuals <- residuals(mdl)
+sigma <- sd(residuals)
+ps <- dnorm(dat_scaled$Creatinine, y_hat, sigma)
+```
+
+```{r}
+ps_model <-glm(Creatinine ~ Age, data=dat_scaled, weights=ps)
+
+
+summary(ps_model)
+
+```
+```{r}
+cor_mdl <- coxph(Surv(TIME, Event) ~ Age,
+                data = dat_scaled,  weights=ps)
+
+summary(cor_mdl)
+```
+# Propensity scores Tomas
+
+```{r}
+library( stddiff )
+library( forestplot )
+library( MatchIt )
+
+
+
+mdl <- lm( Creatinine ~ Age,
+            data=dat_scaled)
+
+sigma <- sd(mdl$residuals)
+
+y_hat <- fitted(mdl)
+y <- dat_scaled$Creatinine
+
+p_score = dnorm(y,y_hat,sigma)
+
+plot(y_hat, p_score)
+
+new_mdl <- glm( Creatinine ~ Age + p_score ,
+            data=dat_scaled)
+
+summary(new_mdl)
+
+```
+
+```{r}
+mdl_lin<- glm( Event ~ Creatinine + Age + p_score ,
+            data=dat_scaled)
+#summary(mdl_lin)
+
+mdl_lin1<- glm( Event ~ Creatinine + Age ,
+            data=dat_scaled)
+#summary(mdl_lin1)
+
+
+mdl_cx <- coxph(Surv(TIME, Event) ~ Creatinine + Age + p_score,
+                data = dat_scaled)
+
+#summary( mdl_cx )
+
+
+
+mdl_cx1 <- coxph(Surv(TIME, Event) ~ Creatinine + Age,
+                data = dat_scaled)
+
+summary( mdl_cx1 )
+```
+
+```{r}
+pscore_logit <- predict( mdl )
+pscore <- exp(pscore_logit) / (1+exp(pscore_logit))
+
+
+# You would typically use the method "nearest" with a specified caliper for propensity scores
+
+# Convert levels "Q1" and "Q2" to FALSE (0), and "Q3" and "Q4" to TRUE (1)
+dat_structure_learn$Creatinine_binary <- ifelse(dat_structure_learn$Creatinine %in% c("Q1 (Lowest)", "Q2"), 0, 1)
+
+# Convert the new binary variable to a factor with labels FALSE and TRUE
+dat_structure_learn$Creatinine_binary <- factor(dat_structure_learn$Creatinine_binary, levels = c(0, 1), labels = c("FALSE", "TRUE"))
+
+
+mm <- matchit(Creatinine_binary ~ pscore, data = dat_structure_learn, method = "full")
+
+matched_data <- match.data(mm)
+#summary(coxph(Surv(TIME, Event) ~ Creatinine + Age,
+ #        data = dat_structure_learn))
+```
+
+```{r}
+# Assuming 'treatment' is your binary or multi-level treatment variable
+# 'pscore' is your precomputed propensity score
+# 'dat_structure_learn' is your data frame
+library(Matching)
+# Assuming 'pscore' is your vector of propensity scores
+# Prepare a matrix of the covariates used to compute 'pscore'
+X <- model.matrix(Creatinine~ pscore, data = dat_structure_learn)
+
+# Perform matching
+matched_results <- Match(Y = dat_structure_learn$Creatinine, Tr = pscore, X = X, M = 1)
+
+# Extract indices of matched units
+matched_indices <- matched_results$index.treated
+
+# Subset the original data to get the matched dataset
+matched_data <- dat_structure_learn[matched_indices, ]
+
+
+```
+```{r}
+cls <- c("Age")
+match_imb <- as.data.frame(stddiff.numeric(dat_scaled, vcol=cls, gcol="Creatinine"))
+forestplot(
+labeltext = cls,
+mean=match_imb$stddiff,
+lower=match_imb$stddiff.l,
+upper=match_imb$stddiff.u )
+
+```
+
+```{r}
+cls <- c("Age")
+match_imb <- as.data.frame(stddiff.numeric(matched_data, vcol=cls, gcol="Creatinine"))
+forestplot(
+labeltext = cls,
+mean=match_imb$stddiff,
+lower=match_imb$stddiff.l,
+upper=match_imb$stddiff.u )
+
+```
+
+#Case control
+
+```{r}
+table( dat_scaled$Event )
+```
+
+```{r}
+samp <- rep("FALSE",nrow(dat_scaled))
+samp[dat_scaled$Event=="TRUE"] <- "TRUE"
+```
+
+```{r}
+samp[sample(which(dat_scaled$Event=="FALSE"), sum(dat_scaled$Event))] <- "TRUE"
+```
+
+```{r}
+m <- lm( Event ~ Creatinine, dat_scaled )
+coef(m)
+```
+
+```{r}
+m_2 <- lm( Event ~ Creatinine, dat_scaled[samp=="TRUE",] )
+coef(m_2)
+```
+
+```{r}
+# Base plot
+plot(coef(m)['Creatinine'], 2, xlim = c(0,0.3), ylim = c(0.5, 2.5), pch = 19, 
+     yaxt = "n", ylab = "", bty = "n")
+
+# First set of segments (confidence intervals)
+ci <- confint(m)['Creatinine', ]
+segments(x0 = ci[1], x1 = ci[2], y0 = 2, y1 = 2)
+
+# Second set of points
+points(coef(m_2)['Creatinine'], 1, pch = 19, col = 2)
+
+# Second set of segments (confidence intervals)
+segments(x0 = ci[1], x1 = ci[2], y0 = 1, y1 = 1, col = 2)
+
+# Add legend
+legend("topleft", c("population", "sample"), lty = 1, col = 1:2)
+
+```
+
+```{r}
+m <- glm( Event ~ Creatinine, dat_scaled, family="binomial" )
+coef(m)
+```
+
+```{r}
+m_2 <- glm( Event ~ Creatinine, dat_scaled[samp=="TRUE",], family="binomial" )
+coef(m_2)
+```
+
+```{r}
+plot( coef(m)['Creatinine'], 2, xlim=c(0,2), ylim=c(0.5,2.5), pch=19,
+yaxt="n", ylab="", bty="n" )
+ci <- confint(m)['Creatinine',]
+
+segments( x0=ci[1], x1=ci[2], y0=2, y1=2 )
+
+
+points( coef(m_2)['Creatinine'], 1, pch=19, col=2 )
+ci <- confint(m_2)['Creatinine',]
+
+segments( x0=ci[1], x1=ci[2], y0=1, y1=1, col=2 )
+legend( "topright", c("population","sample"), lty=1, col=1:2 )
+
+```
+
+#Structure learning
+
+```{r}
+library(bnlearn)
+```
+
+```{r}
+# Clone the original dataframe
+
+
+dat_structure_learn <- dat_scaled
+
+dat_structure_learn$Diabetes <- NULL
+dat_structure_learn$TIME <- NULL
+dat_structure_learn$Anaemia  <- NULL
+dat_structure_learn$TIME <- NULL
+dat_structure_learn$Platelets <- NULL
+dat_structure_learn$CPK <- NULL
+
+# Convert TIME to numeric
+dat_structure_learn$Event <- factor(dat_structure_learn$Event)
+dat_structure_learn$Smoking <- factor(dat_structure_learn$Smoking)
+
+dat_structure_learn$BP <- factor(dat_structure_learn$BP)
+
+# Use the new dataframe in pc.stable
+
+blacklist <- data.frame(from = "Event", to = setdiff(names(dat_structure_learn), "Event"))
+
+fit <- pc.stable(dat_structure_learn, blacklist = blacklist)
+
+```
+
+```{r}
+plot(fit)
+```
+
+```{r}
+# Calculate the 33rd and 66th percentiles
+quantiles <- quantile(dat_structure_learn$Age, probs = c(1/3, 2/3))
+
+# Divide Age into three groups based on these quantiles
+dat_structure_learn$Age <- cut(dat_structure_learn$Age, 
+                           breaks = c(-Inf, quantiles, Inf), 
+                           labels = c("Young", "Middle", "Old"), 
+                           include.lowest = TRUE)
+
+# Calculate the 33rd and 66th percentiles
+creatinine_quantiles <- quantile(dat_structure_learn$Ejection.Fraction, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+dat_structure_learn$Ejection.Fraction <- cut(dat_structure_learn$Ejection.Fraction,
+                                  breaks = creatinine_quantiles,
+                                  include.lowest = TRUE,
+                                  labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4 (Highest)"))
+
+quantiles <- quantile(dat_structure_learn$Sodium, probs = c(1/3, 2/3))
+
+# Divide Age into three groups based on these quantiles
+dat_structure_learn$Sodium <- cut(dat_structure_learn$Sodium, 
+                           breaks = c(-Inf, quantiles, Inf), 
+                           labels = c("Low", "Average", "High"), 
+                           include.lowest = TRUE)
+
+creatinine_quantiles <- quantile(dat_structure_learn$Creatinine, probs = c(0, 0.25, 0.5, 0.75, 1), na.rm = TRUE)
+
+dat_structure_learn$Creatinine <- cut(dat_structure_learn$Creatinine,
+                                  breaks = creatinine_quantiles,
+                                  include.lowest = TRUE,
+                                  labels = c("Q1 (Lowest)", "Q2", "Q3", "Q4 (Highest)"))
+
+```
+
+```{r}
+
+hist(dat_structure_learn$Creatinine, main = "Creatinine Distribution", xlab = "Creatuinine", ylab = "Frequency")
+
+```
+Using blacklisting, however now nothing is connected with event:
+```{r}
+blacklist <- data.frame(from = "Event", to = setdiff(names(dat_structure_learn), "Event"))
+
+fit <- pc.stable(dat_structure_learn, blacklist=blacklist)
+plot(fit)
+```
+
+```{r}
+
+# Initialize an empty network with nodes
+final_dag <- empty.graph(nodes = c("BP", "Age", "Creatinine", "Sodium", "Ejection.Fraction", "Gender", "Event"))
+
+# Add arcs as per the specified structure
+final_dag <- set.arc(final_dag, from = "BP", to = "Event")
+final_dag <- set.arc(final_dag, from = "Age", to = "Creatinine")
+final_dag <- set.arc(final_dag, from = "Creatinine", to = "Sodium")
+final_dag <- set.arc(final_dag, from = "Sodium", to = "Ejection.Fraction")
+final_dag <- set.arc(final_dag, from = "Gender", to = "Ejection.Fraction")
+final_dag <- set.arc(final_dag, from = "Ejection.Fraction", to = "Event")
+final_dag <- set.arc(final_dag, from = "Creatinine", to = "Event")
+
+```
+
+```{r}
+
+dat_structure_learn_no_Smok <- dat_structure_learn
+dat_structure_learn_no_Smok$Smoking <- NULL
+
+blacklist <- data.frame(from = "Event", to = setdiff(names(dat_structure_learn_no_Smok), "Event"))
+
+
+fit <- hc(dat_structure_learn_no_Smok, start = final_dag, blacklist = blacklist)
+
+plot(fit)
+```
+```{r}
+# Define a whitelist that forces an arc from Creatinine to Event
+whitelist <- data.frame(from = "Creatinine", to = "Event")
+
+# Use the whitelist in the structure learning function
+fit <- bnlearn::pc.stable(dat_structure_learn, whitelist = whitelist, blacklist=blacklist)
+
+
+```
+
+```{r}
+
+dat_learning_ordered <- dat_structure_learn_no_Smok[c(setdiff(names(dat_structure_learn_no_Smok), "Event"), "Event")]
+
+fit <- hc(dat_structure_learn_no_Smok, start = final_dag)
+
+plot(fit)
+
+```
